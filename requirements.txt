@@ -1,0 +1,12 @@
+Flask>=2.3.0
+waitress>=2.1.0
+requests>=2.31.0
+websocket-client>=1.6.0
+python-dotenv>=1.0.0
+
+# 注意：xtquant 不要 pip 安装
+# 直接用 QMT 客户端安装目录下的 SDK：
+#   <QMT安装目录>\bin.x64\Lib\site-packages\xtquant
+# broker.py 会根据 Config.QMT_PATH 自动把这个目录加进 sys.path
+# 原因：xtquant 的 .pyd 和一堆 DLL 需要跟本地 QMT 客户端版本严格匹配，
+#      pip 上的版本不是官方包，且会跟客户端协议错配导致连不上 miniQMT
