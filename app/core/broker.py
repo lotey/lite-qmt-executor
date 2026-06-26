@@ -264,6 +264,10 @@ class QmtBroker:
         positions = self.xt_trader.query_stock_positions(self.stock_account)
         result = []
         for p in positions:
+            # 过滤已清仓的无效记录
+            if p.volume <= 0:
+                continue
+                
             today_volume = p.volume - p.yesterday_volume
             result.append(PositionInfo(
                 stock_code=p.stock_code,
@@ -375,9 +379,10 @@ class QmtBroker:
         
         if side_upper == 'BUY':
             high_limit = quote.get('high_limit', 0.0) if quote else 0.0
-            premium = StgConfig.BUY_PRICE_PREMIUM if use_premium else 0.0
-            # 统一使用数学四舍五入
-            buy_price = int((price + premium) * 100 + 0.5 + 1e-9) / 100
+            # 动态比例溢价，自适应高低价股的滑点扫单价差
+            ratio = StgConfig.BUY_PRICE_PREMIUM_RATIO if use_premium else 0.0
+            # 统一使用数学四舍五入到分
+            buy_price = int((price * (1 + ratio)) * 100 + 0.5 + 1e-9) / 100
             if high_limit > 0:
                 buy_price = min(buy_price, high_limit)
             return buy_price

@@ -6,8 +6,7 @@
 核心思路：
 - 9:30 后加载昨日持仓建任务表（排除今日买入和已卖出的）
 - 每只票按 SELL_PROFIT_TIERS 配置分档卖出，例如：
-    [(3.0, 0.5),    # 涨幅达 3%，卖 50%
-     (5.0, 0.5),    # 涨幅达 5%，卖剩余全部的 50%
+    [(5.0, 0.5),    # 涨幅达 5%，卖 50%
      (8.0, 1.0)]    # 涨幅达 8%，卖剩余全部
 - 最后一档兜底卖完所有剩余股数
 - 每次卖出前实时查持仓，避免人工已卖导致超卖
@@ -21,11 +20,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 from app.config import Config
-from app.strategy.default.stg_config import StgConfig
 from app.strategy.buy_strategy import StrategyContext, OrderTracker
 from app.strategy.sell_strategy import SellStrategy
-from app.core.broker import PositionInfo, OrderInfo
 from app.strategy.common import latency_suffix
+from .stg_config import StgConfig
 
 logger = logging.getLogger(__name__)
 
@@ -34,27 +32,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SellTickContext:
-    """卖出策略的轮询周期上下文快照，封装全量持仓与订单，防止内部循环发起高频 I/O"""
-    positions: List[PositionInfo]
-    orders: Dict[int, OrderInfo]
-
+    """Tick 轮询级别的运行时上下文，打包该轮的内存快照数据"""
+    positions: list
+    orders: dict
 
 @dataclass
 class SellDirective:
-    """卖出指令数据结构，解耦离散参数"""
-    stock_code: str
+    """发单指令，打包离散的发单参数"""
+    tier_idx: int
     volume: int
     price: float
     chg: float
-    tier_idx: int
-
-
-# ==================== 状态追踪 ====================
-
-@dataclass
-class SellOrderTracker(OrderTracker):
-    """卖出订单生命周期追踪类"""
-    pass
+    pos: object
 
 
 @dataclass
@@ -66,9 +55,13 @@ class _Task:
     tier_index: int = 0
     phase: str = "WATCHING"  # 观察中 / 已完成 (WATCHING / DONE)
     order_ids: List[int] = field(default_factory=list)
-    order_trackers: Dict[int, SellOrderTracker] = field(default_factory=dict) # 委托ID -> SellOrderTracker 映射 (order_id -> SellOrderTracker)
     tier_sold_volumes: List[int] = field(default_factory=list) # 分档索引 -> 该档位已成交的股数 (index -> sold_volume in this tier)
     tier_order_ids: dict = field(default_factory=dict)       # 分档索引 -> 委托ID (tier_index -> order_id)
+    order_trackers: dict = field(default_factory=dict)       # 委托ID -> OrderTracker (order_id -> OrderTracker)
+
+
+
+
 
 
 def _calc_tier_volumes(total: int, tiers: List[Tuple[float, float]]) -> List[int]:
@@ -158,7 +151,7 @@ class ProfitTierSellStrategy(SellStrategy):
         if not self._tasks:
             return
 
-        # 性能(持仓查询优化): 在整轮 tick 开始前只查询一次柜台持仓列表，避免在循环中高频重复调用 get_positions()，降低柜台负载
+        # 性能(持仓查询优化): 在整轮 tick 开始前只查询一次柜台持仓列表和订单列表，避免在循环中高频重复调用，降低柜台负载
         positions = self._ctx.broker.get_positions()
         
         # 风控(接口闪断保护): 如果在 tick 头部获取到的持仓列表为空，且 broker 状态断开，说明是接口超时等异常，不应误判为已卖光，直接跳过本轮
@@ -166,11 +159,10 @@ class ProfitTierSellStrategy(SellStrategy):
             logger.warning(f"[{self.name()}] 检测到 QMT 处于断开状态，跳过本轮持仓同步")
             return
 
-        # 性能优化与并发安全：由于卖出任务可能是并发且动态变化的，我们绝不能跨任务或跨时间使用陈旧缓存。
-        # 但为了避免在多任务循环体内部多次发起冗余的 get_orders() 全量 I/O，在此处拉取一次绝对实时的订单全量快照。
         orders_list = self._ctx.broker.get_orders()
-        orders_dict = {o.order_id: o for o in orders_list}
-        tctx = SellTickContext(positions=positions, orders=orders_dict)
+        orders = {o.order_id: o for o in orders_list}
+
+        tctx = SellTickContext(positions=positions, orders=orders)
 
         for task in list(self._tasks.values()):
             if task.phase == "DONE":
@@ -265,15 +257,12 @@ class ProfitTierSellStrategy(SellStrategy):
             task.phase = "DONE"
             return
 
-        # 获取最新行情以进行价格和涨幅校验
+        # 获取最新行情以进行价格 and 涨幅校验
         quote = self._ctx.broker.get_stock_quote(task.stock_code)
         if not quote or quote['last_price'] <= 0:
             return
         chg = quote['change_pct']
         price = quote['last_price']
-
-        # 1. 扫描柜台订单状态，同步成交与自愈
-        orders = tctx.orders
         
         # 遍历已发送的活跃订单
         for oid in list(task.order_ids):
@@ -286,14 +275,13 @@ class ProfitTierSellStrategy(SellStrategy):
             
             if t_idx is None:
                 task.order_ids.remove(oid)
-                task.order_trackers.pop(oid, None)
                 continue
                 
-            o = orders.get(oid)
-            tracker = task.order_trackers.get(oid)
+            o = tctx.orders.get(oid)
             
             # 风控(等订单同步): 柜台未同步，需判断是否超时以防丢单
             if o is None:
+                tracker = task.order_trackers.get(oid)
                 elapsed = _time.time() - (tracker.submit_time if tracker else 0.0)
                 if elapsed < StgConfig.SELL_SYNC_TIMEOUT:
                     logger.warning(f"[{self.name()}][等同步] {task.stock_code} 最新委托 {oid} 尚未同步 (已等 {elapsed:.1f}s)，暂不处理")
@@ -304,39 +292,41 @@ class ProfitTierSellStrategy(SellStrategy):
                     logger.warning(msg)
                     self._ctx.notifier.push("WARNING", msg)
                     task.order_ids.remove(oid)
-                    task.order_trackers.pop(oid, None)
                     task.tier_order_ids.pop(t_idx, None)
+                    task.order_trackers.pop(oid, None)
                     return
 
             # 废单自愈处理
             if o.is_rejected():
+                tracker = task.order_trackers.get(oid)
                 latency_str = latency_suffix(tracker.submit_time if tracker else 0.0)
-                logger.warning(f"[{self.name()}][废单提示] {task.stock_code} 委托号 {oid} 成为废单({o.status_msg or '未知'})，将其剥离并允许自动重试{latency_str}")
+                logger.warning(f"[废单提示] {task.stock_code} 委托号 {oid} 被拒({o.status_msg or '未知'}), 已剥离重试{latency_str}")
                 task.order_ids.remove(oid)
-                task.order_trackers.pop(oid, None)
                 task.tier_order_ids.pop(t_idx, None)
+                task.order_trackers.pop(oid, None)
                 continue
 
             # 增量成交检测与推送
-            last_notified = tracker.notified_volume if tracker else 0
-            if o.traded_volume > last_notified:
-                newly_filled = o.traded_volume - last_notified
-                if tracker:
+            tracker = task.order_trackers.get(oid)
+            if tracker:
+                last_notified = tracker.notified_volume
+                if o.traded_volume > last_notified:
+                    newly_filled = o.traded_volume - last_notified
                     tracker.notified_volume = o.traded_volume
-                task.tier_sold_volumes[t_idx] += newly_filled
-                fill_price = o.traded_price if o.traded_price > 0 else o.price
-                # 消息格式统一规范：✅ [分档止盈] 股票代码 卖出 股数@单价元 涨幅=百分比%
-                # 例如：✅ [分档止盈] sz000001 卖出 500股@10.80元 涨幅=5.20%
-                msg = f"✅ [分档止盈] {task.stock_code} 卖出 {newly_filled}股@{fill_price:.2f}元 涨幅={chg:.2f}%"
-                latency_str = latency_suffix(tracker.submit_time if tracker else 0.0, active_check_order=o)
-                logger.info(msg + latency_str)
-                self._ctx.notifier.push("INFO", msg)
+                    task.tier_sold_volumes[t_idx] += newly_filled
+                    fill_price = o.traded_price if o.traded_price > 0 else o.price
+                    # 消息格式统一规范：✅ [分档止盈] 股票代码 卖出 股数@单价元 涨幅=百分比%
+                    # 例如：✅ [分档止盈] sz000001 卖出 500股@10.80元 涨幅=5.20%
+                    msg = f"✅ [分档止盈] {task.stock_code} 卖出 {newly_filled}股@{fill_price:.2f}元 涨幅={chg:.2f}%"
+                    latency_str = latency_suffix(tracker.submit_time, active_check_order=o)
+                    logger.info(msg + latency_str)
+                    self._ctx.notifier.push("INFO", msg)
 
             # 订单已结束（非活跃状态）
             if not o.is_active():
                 task.order_ids.remove(oid)
-                task.order_trackers.pop(oid, None)
                 task.tier_order_ids.pop(t_idx, None)
+                task.order_trackers.pop(oid, None)
 
         tiers = StgConfig.SELL_PROFIT_TIERS
         # 找当前涨幅命中的最高档
@@ -353,22 +343,17 @@ class ProfitTierSellStrategy(SellStrategy):
         for i in range(min(hit_index + 1, len(task.tier_volumes))):
             target_vol = task.tier_volumes[i]
             sold_vol = task.tier_sold_volumes[i]
-            if sold_vol >= target_vol:
-                continue  # 该档已全部成交，过
             
             # 检查该档当前是否有活跃委托
             if i in task.tier_order_ids:
                 continue  # 正在挂单中，等其结果
                 
+            if sold_vol >= target_vol:
+                continue  # 该档已全部成交，过
+                
             # 需要补单卖出该档的剩余数量
             remain_vol = target_vol - sold_vol
-            directive = SellDirective(
-                stock_code=task.stock_code,
-                volume=remain_vol,
-                price=price,
-                chg=chg,
-                tier_idx=i
-            )
+            directive = SellDirective(tier_idx=i, volume=remain_vol, price=price, chg=chg, pos=pos)
             self._do_sell_tier(task, directive)
 
         # 检查是否所有分档都已卖足
@@ -381,14 +366,12 @@ class ProfitTierSellStrategy(SellStrategy):
             task.phase = "DONE"
 
     def _do_sell_tier(self, task: _Task, directive: SellDirective):
-        # 风控(防超卖): 实时查持仓，防止人工已卖导致超卖
-        pos = next(
-            (p for p in self._ctx.broker.get_positions() if p.stock_code == task.stock_code),
-            None,
-        )
+        # 性能(降频优化): 复用从 tick 头部传下来的 pos 引用，避免内部高频查 QMT 持仓。
+        # 发单后立刻扣减本地可用数量以防同一 tick 触发多档导致超卖
+        pos = directive.pos
         # 1. 柜台确实完全没有持仓了，将其标为完成以防死循环
         if not pos or pos.volume <= 0:
-            logger.info(f"[{self.name()}] {task.stock_code} 已无持仓，跳过分档 {directive.tier_idx + 1}")
+            logger.info(f"[{self.name()}] {task.stock_code} 已无可用持仓，跳过分档 {directive.tier_idx + 1}")
             task.tier_sold_volumes[directive.tier_idx] = task.tier_volumes[directive.tier_idx]
             return
             
@@ -421,8 +404,11 @@ class ProfitTierSellStrategy(SellStrategy):
         if result.success:
             self._sold.add(task.stock_code)
             task.order_ids.append(result.order_id)
-            task.order_trackers[result.order_id] = SellOrderTracker(submit_time=_time.time())
             task.tier_order_ids[directive.tier_idx] = result.order_id
+            task.order_trackers[result.order_id] = OrderTracker(submit_time=_time.time())
+            
+            # 手动扣减可用资金以供同一 tick 里的后续分档判断，完美消灭内部查询
+            pos.can_use_volume -= actual
             
             # 只记录订单信息，不发送挂单通知
             pass

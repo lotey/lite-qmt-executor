@@ -26,7 +26,6 @@ from app.core.trading_engine import TradingEngine
 
 # 默认策略（功能完整版，开箱即用）
 from app.strategy.default.accumulate_buy import AccumulateBuyStrategy
-from app.strategy.default.open_high_sell import OpenHighSellStrategy
 from app.strategy.default.profit_tier_sell import ProfitTierSellStrategy
 
 logger = logging.getLogger(__name__)
@@ -102,16 +101,18 @@ def build_engine() -> TradingEngine:
     """组装引擎和策略。要换自己的策略在这里改。"""
     broker = QmtBroker(Config.QMT_PATH, Config.ACCOUNT_ID)
 
+    # 盘前安全获取并缓存初始总资产基准（内部自动进行重试）
+    Config.TODAY_TOTAL_ASSETS = broker.get_initial_total_asset(max_retries=5, retry_interval=10.0)
+
     # 通知器。默认走控制台，需要 IM 推送自行实现 Notifier 接口注入
     notifier = ConsoleNotifier()
 
     engine = TradingEngine(broker, notifier)
 
     # 注册买入策略
-    engine.register_buy_strategy("default", AccumulateBuyStrategy())
+    engine.register_buy_strategy(AccumulateBuyStrategy())
 
     # 注册卖出策略
-    engine.register_sell_strategy(OpenHighSellStrategy())
     engine.register_sell_strategy(ProfitTierSellStrategy())
 
     return engine

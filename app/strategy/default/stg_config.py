@@ -6,6 +6,15 @@
 
 from datetime import time
 
+# ==================== 信号类型常量 ====================
+SIGNAL_TYPE_ACTIVE = "ACTIVE"      # 常规信号（买入）
+SIGNAL_TYPE_HOLDGRD = "HOLDGRD"    # 竞价止损核按钮（卖出）
+
+# ==================== 统一信号路由映射表 ====================
+SIGNAL_ROUTE_MAP = {
+    SIGNAL_TYPE_ACTIVE: "AccumulateBuyStrategy",
+    SIGNAL_TYPE_HOLDGRD: "OpeningSellStrategy",
+}
 
 class StgConfig:
     # ----- 分档累积买入策略 (AccumulateBuyStrategy) -----
@@ -32,8 +41,8 @@ class StgConfig:
     BUY_MAX_COUNT = 3
     # 加仓回撤比例（当前价 ≤ 上次买价 × 此比例 才加仓）
     BUY_PULLBACK_RATIO = 0.98
-    # 挂单溢价（当前价 + 此值 挂卖一上方扫单）
-    BUY_PRICE_PREMIUM = 0.05
+    # 扫单溢价比例（目标挂单价 = 现价 × (1 + 此比例(0.2%))）
+    BUY_PRICE_PREMIUM_RATIO = 0.002
 
     # 骗炮拦截比例（当前价 ≤ 开盘价 × 此比例 时，判定为骗炮并停止后续加仓，0.995 代表跌破开盘价 0.5%）
     BUY_FAKE_BREAKOUT_RATIO = 0.995

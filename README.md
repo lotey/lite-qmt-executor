@@ -27,7 +27,7 @@
 | 策略 | 文件 | 说明 |
 |------|------|------|
 | 分档累积买入 | `default/accumulate_buy.py` | 按涨幅分流：抢买/首笔保底+回撤加仓/等回落，带撤单重挂 |
-| 高开止盈 | `default/open_high_sell.py` | 9:30:02 并发池抢卖高开票 |
+| 开盘抢跑卖出 | `default/opening_sell.py` | 9:30:02 并发池抢卖（支持高开止盈与外部指令核按钮） |
 | 分档盈利止盈 | `default/profit_tier_sell.py` | 涨幅达标分档卖出，实时查持仓防超卖 |
 
 ---
@@ -86,9 +86,9 @@ python main.py
 ### 测试信号
 
 ```bash
-curl -X POST http://localhost:30015/api/buy \
+curl -X POST http://localhost:30015/api/signal \
      -H "Content-Type: application/json" \
-     -d "{\"code\":\"sz000001\"}"
+     -d "{\"code\":\"sz000001\", \"action\":\"BUY\", \"type\":\"ACTIVE\", \"payload\":{}}"
 ```
 
 ---
@@ -141,9 +141,10 @@ lite-qmt-executor/
 ├── app/
 │   ├── config.py               # 底层调度与网络连接配置（本端基础参数在此修改）
 │   ├── core/
-│   │   ├── broker.py           # xtquant 接口封装
-│   │   ├── notifier.py         # 通知器接口 + 默认实现
-│   │   └── trading_engine.py   # 交易调度总控
+│   │   ├── broker.py           # xtquant 封装
+│   │   ├── heartbeat.py        # 运行心跳记录
+│   │   ├── notifier.py         # 通知器接口
+│   │   └── trading_engine.py   # 交易总控
 │   ├── engine/
 │   │   ├── buy_engine.py       # 买入调度骨架
 │   │   └── sell_engine.py      # 卖出调度骨架
@@ -157,7 +158,7 @@ lite-qmt-executor/
 │       └── default/            # 默认策略实现
 │           ├── stg_config.py   # 策略专属个性化配置
 │           ├── accumulate_buy.py
-│           ├── open_high_sell.py
+│           ├── opening_sell.py
 │           └── profit_tier_sell.py
 └── doc/
     ├── miniQMT环境搭建与FAQ.md   # 新手指南和常见问题
@@ -167,18 +168,60 @@ lite-qmt-executor/
 
 ---
 
-## HTTP API
+## 信号接入 (HTTP & WebSocket)
+
+两者共享相同的 JSON 信号协议（见 `/api/signal` 说明）。
+
+### 1. HTTP API
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/api/buy` | 买入信号入队 `{code, strategy}` |
-| `GET` | `/api/tasks` | 查当前买入任务状态 |
-| `POST` | `/api/sell` | 手动卖出 `{code, volume, price}` |
-| `GET` | `/api/positions` | 查持仓 |
-| `GET` | `/api/orders` | 查委托 |
-| `GET` | `/api/account` | 查账户 |
+| `POST` | `/api/signal` | **统一信号入口**。接收协议：`{"code": "sz000001", "action": "BUY", "type": "ACTIVE", "payload": {"price": 10.5}}` |
+| `GET`  | `/api/tasks`  | 查当前买入任务状态 |
+| `POST` | `/api/buy`    | **物理通道**：跳过策略直接下柜台买单 `{code, volume, price}` |
+| `POST` | `/api/sell`   | **物理通道**：跳过策略直接下柜台卖单 `{code, volume, price}` |
+| `GET`  | `/api/positions` | 查持仓 |
+| `GET`  | `/api/orders` | 查委托 |
+| `GET`  | `/api/account`| 查账户 |
 | `POST` | `/api/cancel/<order_id>` | 撤单 |
-| `GET` | `/health` | 健康检查 |
+| `GET`  | `/health`     | 健康检查 |
+
+### 2. WebSocket 信号网关
+
+在 `app/config.py` 中配置 `GATEWAY_HOST` / `GATEWAY_PORT` / `GATEWAY_TOKEN`，三者都填了才会启动 WebSocket 客户端。
+
+**重连策略**：
+- **从未连上过**：连续失败 3 次放弃（配置错误早发现）
+- **曾经连上过**：永不放弃，持续重连（网络抖动自动恢复）
+
+*提示：不配置 WebSocket 也能正常使用，HTTP API 始终可用，直接用 curl 发信号一样跑。*
+
+### 3. 信号协议格式
+
+在 HTTP 模式下，所有信号均统一以 `POST` 方法发送至 `/api/signal` 接口。HTTP 与 WebSocket 均使用相同的 JSON 格式进行通信投递：
+
+**买入信号示例** (`POST /api/signal`)：
+```jsonc
+{
+    "code": "sz000001",        // 必填：股票代码
+    "action": "BUY",           // 必填：BUY (买入)
+    "type": "ACTIVE",          // 选填：信号类型，引擎依据此字段匹配执行策略
+    "payload": {               // 选填：附加参数字典，动态透传给策略处理
+        "price": 10.5,
+        "volume": 1000
+    }
+}
+```
+
+**一键清仓信号示例** (`POST /api/signal`)：
+```jsonc
+{
+    "code": "sz000001",        // 必填：股票代码
+    "action": "SELL",          // 必填：SELL (卖出)
+    "type": "HOLDGRD",         // 必填：信号类型
+    "payload": {}              // 选填
+}
+```
 
 ---
 
@@ -195,19 +238,7 @@ lite-qmt-executor/
 
 详见 **[doc/定制开发指南.md](doc/定制开发指南.md)**，含完整代码模板和常见问题。
 
----
 
-## WebSocket 信号网关
-
-配置 `GATEWAY_HOST` / `GATEWAY_PORT` / `GATEWAY_TOKEN` 三个都填了才启动 WebSocket 客户端。
-
-重连策略：
-- 从未连上过：连续失败 3 次放弃（配置错误早发现）
-- 曾经连上过：永不放弃，持续重连（网络抖动自动恢复）
-
-不配置 WebSocket 也能用——HTTP API 始终可用，curl 发信号一样跑。
-
----
 
 ## 注意事项
 
