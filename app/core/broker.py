@@ -264,6 +264,10 @@ class QmtBroker:
         positions = self.xt_trader.query_stock_positions(self.stock_account)
         result = []
         for p in positions:
+            # 过滤已清仓的无效记录
+            if p.volume <= 0:
+                continue
+                
             today_volume = p.volume - p.yesterday_volume
             result.append(PositionInfo(
                 stock_code=p.stock_code,
@@ -363,6 +367,22 @@ class QmtBroker:
             except Exception as e:
                 logger.error(f"断开连接失败: {e}")
 
+    def get_initial_total_asset(self, max_retries: int = 5, retry_interval: float = 10.0) -> float:
+        """获取今日初始总资产基准（带自旋重试）"""
+        logger.info("正在同步账户资产与持仓...")
+        for attempt in range(1, max_retries + 1):
+            account = self.get_account_info()
+            positions = [p for p in self.get_positions() if p.volume > 0]
+            if account and account.total_asset > 0 and (account.market_value <= 0 or positions):
+                logger.info(f"[OK] 账户就绪: 总资产 {account.total_asset:.2f} 元 (持仓 {len(positions)} 只)")
+                return account.total_asset
+            if attempt < max_retries:
+                logger.warning(f"[!] [重试第 {attempt} 次] QMT 柜台未就绪，{retry_interval}秒后重试...")
+                time.sleep(retry_interval)
+        msg = f"连续 {max_retries} 次等待 QMT 柜台未就绪，终止启动！"
+        logger.error(f"[FATAL] {msg}")
+        raise BrokerError(msg)
+
     # ==================== 价格计算与保护 ====================
 
     def calculate_price(self, stock_code: str, price: float, side: str, use_premium: bool = True) -> float:
@@ -375,9 +395,10 @@ class QmtBroker:
         
         if side_upper == 'BUY':
             high_limit = quote.get('high_limit', 0.0) if quote else 0.0
-            premium = StgConfig.BUY_PRICE_PREMIUM if use_premium else 0.0
-            # 统一使用数学四舍五入
-            buy_price = int((price + premium) * 100 + 0.5 + 1e-9) / 100
+            # 动态比例溢价，自适应高低价股的滑点扫单价差
+            ratio = StgConfig.BUY_PRICE_PREMIUM_RATIO if use_premium else 0.0
+            # 统一使用数学四舍五入到分
+            buy_price = int((price * (1 + ratio)) * 100 + 0.5 + 1e-9) / 100
             if high_limit > 0:
                 buy_price = min(buy_price, high_limit)
             return buy_price

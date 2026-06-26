@@ -54,13 +54,21 @@ def run_server(engine, host=None, port=None):
     def on_message(ws, message):
         """收到信号 → 入队，立即返回，不阻塞收包线程"""
         try:
+            from app.strategy.default.stg_config import SIGNAL_TYPE_ACTIVE
             data = json.loads(message)
             code = data.get('code')
-            if not code:
+            action = data.get('action')
+            if not code or not action:
                 logger.warning(f"收到无效信号: {message}")
                 return
-            logger.info(f"收到信号: {code} (原始数据: {message})")
-            engine.submit(code)
+
+            payload = data.get('payload') if isinstance(data.get('payload'), dict) else {}
+            signal_type = data.get('type', SIGNAL_TYPE_ACTIVE)
+            logger.info(f"收到信号: {code} action={action} type={signal_type} payload={payload}")
+
+            # 入队，由引擎的消费线程异步处理
+            engine.submit(code, action=action, signal_type=signal_type, payload=payload)
+
         except Exception as e:
             logger.error(f"处理信号异常: {e}", exc_info=True)
 

@@ -40,11 +40,22 @@ class Config:
     # 买入总开关（设为 False 可临时屏蔽所有买入信号，卖出不受影响）
     BUY_ENABLED = False
 
+    # 预定义交易时段边界对象，避免高频调用时重复实例化，极致压降时延
+    _MORNING_START = time(9, 0)
+    _MORNING_END = time(11, 30)
+    _AFTERNOON_START = time(13, 0)
+    _AFTERNOON_END = time(15, 0)
+
     @classmethod
     def in_trading_window(cls) -> bool:
-        """当前是否在交易窗口（9:00-15:00），周末暂不排除"""
-        now = datetime.now().time()
-        return cls.TRADING_OPEN <= now < cls.TRADING_CLOSE
+        """当前是否在交易窗口（工作日 上午9:00-11:30，下午13:00-15:00）"""
+        now = datetime.now()
+        # 排除周六周日 (weekday 5和6)
+        if now.weekday() >= 5:
+            return False
+            
+        cur_time = now.time()
+        return (cls._MORNING_START <= cur_time < cls._MORNING_END) or (cls._AFTERNOON_START <= cur_time < cls._AFTERNOON_END)
 
     # ==================== 买入引擎调度参数（框架）====================
     BUY_POLL_INTERVAL = 3           # ticker 周期（秒）
@@ -53,6 +64,7 @@ class Config:
     BUY_DEADLINE = time(14, 50)      # 全局买入截止时间，到点清空所有任务
     NEW_SIGNAL_DEADLINE = time(11, 0)  # 新信号截止时间，此时间后不再接受新股信号
     BUY_RECOVERY_MAX_AGE_MINS = 10      # 灾备恢复最大时效（分钟），超过此时间的未完成信号不进行恢复和补单
+    HEARTBEAT_INTERVAL_SECS = 30        # 系统心跳写入周期（秒）
 
 
     # ==================== 日志配置 ====================
@@ -61,6 +73,10 @@ class Config:
     LOG_FILE = 'qmt_trading.log'
     LOG_BACKUP_DAYS = 7  # 日志按天滚动保留天数
     WAL_BACKUP_DAYS = 7  # WAL 交易状态日志保留天数
+
+    # ==================== 运行期动态变量 ====================
+    # 今日初始总资产（启动成功后由 Broker 获取并更新）
+    TODAY_TOTAL_ASSETS = 0.0
 
     # ==================== 配置校验 ====================
 

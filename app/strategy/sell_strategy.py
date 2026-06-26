@@ -28,3 +28,13 @@ class SellStrategy(ABC):
     def stop(self) -> None:
         """停止工作线程，优雅关停。"""
         ...
+
+    def on_signal(self, code: str, signal_type: str, payload: dict) -> bool:
+        """
+        统一接收并处理从引擎分发下来的信号（默认不处理，子类有需要可重写）
+        :param code: 股票代码
+        :param signal_type: 信号类型，例如 "HOLDGRD"
+        :param payload: 信号携带的附加数据，如 {'price': 10.5}
+        :return: bool 是否成功接收并处理
+        """
+        return False

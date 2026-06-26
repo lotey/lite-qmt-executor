@@ -72,7 +72,7 @@ class BuyEngine:
         self._today_done.setdefault(key, set())
         logger.info(f"已注册买入策略: {key}")
 
-    def start(self) -> None:
+    def start(self, is_fast_reboot: bool = False) -> None:
         if not self._strategies:
             logger.warning("没有注册任何买入策略，BuyEngine 不启动")
             return
@@ -81,7 +81,7 @@ class BuyEngine:
         self._cleanup_old_wals()
         
         # 引擎核心防断点接管：接管并逆推崩溃前留在内存中的待买信号，同时进行主动撤单防重买保护
-        self._recover_state()
+        self._recover_state(is_fast_reboot=is_fast_reboot)
         
         self._running = True
         threading.Thread(target=self._consume_loop, daemon=True, name="BuySignalConsumer").start()
@@ -97,7 +97,7 @@ class BuyEngine:
 
     # ==================== 信号入口 ====================
 
-    def submit(self, code: str, payload: dict = None, strategy_name: str = "default") -> bool:
+    def submit(self, code: str, strategy_name: str, payload: dict = None) -> bool:
         """
         提交信号到指定策略。
         默认 strategy_name='default'，等同于早期单策略行为。
@@ -315,7 +315,7 @@ class BuyEngine:
         except Exception as e:
             logger.error(f"写入 WAL 异常: {e}")
 
-    def _recover_state(self):
+    def _recover_state(self, is_fast_reboot: bool = False):
         """
         买入引擎状态防断点接管核心逻辑。
         流程如下：
@@ -345,23 +345,7 @@ class BuyEngine:
         if not pending:
             return
 
-        # 过滤时效性过期的信号（信号时效性保护）
-        now_ts = _time.time()
-        max_age_seconds = Config.BUY_RECOVERY_MAX_AGE_MINS * 60
-        for code, data in list(pending.items()):
-            enter_ts = data.get('enter_time', 0.0)
-            if enter_ts > 0 and (now_ts - enter_ts) > max_age_seconds:
-                logger.info(f"[买入恢复] 信号 {code} 已超出最大恢复时间({Config.BUY_RECOVERY_MAX_AGE_MINS}min)，系统作废")
-                stg_name = data.get('strategy', 'default')
-                self._append_wal("DONE", code, stg_name)
-                pending.pop(code)
-
-        if not pending:
-            return
-
-        logger.info(f"从 WAL 恢复出 {len(pending)} 个有效待处理信号: {list(pending.keys())}")
-
-        # 清理遗留挂单 (Clean Slate): 主动撤单，打扫战场
+        # 清理遗留挂单 (Clean Slate): 主动撤单，打扫战场（必须在过滤超时前执行，确保超时作废的信号也被正常撤单）
         if self.ctx.broker.is_connected:
             orders = self.ctx.broker.get_orders()
             qmt_codes = {_convert_code(k): k for k in pending.keys()}
@@ -374,6 +358,19 @@ class BuyEngine:
             if cancel_count > 0:
                 logger.info(f"[买入恢复] 已发出 {cancel_count} 笔撤单，等待资金解冻...")
                 _time.sleep(1.0)
+
+        # 过滤时效性过期的信号（若非快速重启，则判定信号全部作废）
+        if not is_fast_reboot:
+            for code, data in list(pending.items()):
+                logger.info(f"[买入恢复] 系统停机时间过长或首次启动，信号 {code} 作废")
+                stg_name = data.get('strategy', 'default')
+                self._append_wal("DONE", code, stg_name)
+                pending.pop(code)
+
+        if not pending:
+            return
+
+        logger.info(f"从 WAL 恢复出 {len(pending)} 个有效待处理信号: {list(pending.keys())}")
 
         # 委托策略进行状态对账与重建
         for code, data in pending.items():
